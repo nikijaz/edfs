@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+fuser = "0.17.0"
 libp2p = { version = "0.56.0", features = ["full"] }
 petname = "3.0.0"
 rand = "0.10.1"
+serde = "1.0.228"
 sha2 = "0.11.0"
 tokio = { version = "1.52.2", features = ["full"] }
