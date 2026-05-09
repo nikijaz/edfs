@@ -1,7 +1,7 @@
 use std::{error::Error, time::Duration};
 
 use libp2p::{
-    Transport,
+    Swarm, Transport,
     core::upgrade,
     futures::StreamExt,
     identity,
@@ -22,30 +22,25 @@ struct Behaviour {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let mut rng = rand::rng(); // TODO: Make It Cryptographic
-    let key = std::env::args().nth(1).unwrap_or_else(|| {
+    let secret = std::env::args().nth(1).unwrap_or_else(|| {
         format!(
             "{}-{:0>4x}",
             petname::petname(2, "-").unwrap(),
-            rng.random_range(0..=0xffff)
+            rand::rng().random_range(0..=0xffff)
         )
     });
-    println!("Mnemonic ID: {key}");
-
-    let hash = sha2::Sha256::digest(key).to_vec();
-    println!(
-        "Hash: {}",
-        hash.iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>()
-    );
+    let secret_hash = sha2::Sha256::digest(secret).to_vec();
 
     let identity = identity::Keypair::generate_ed25519();
+
+    let noise = noise::Config::new(&identity)?.with_prologue(secret_hash);
+    let yamux = yamux::Config::default();
     let transport = tcp::tokio::Transport::new(tcp::Config::default())
         .upgrade(upgrade::Version::V1)
-        .authenticate(noise::Config::new(&identity).unwrap().with_prologue(hash))
-        .multiplex(yamux::Config::default())
+        .authenticate(noise)
+        .multiplex(yamux)
         .boxed();
+
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
         .with_other_transport(|_| transport)?
@@ -70,25 +65,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .behaviour_mut()
         .kademlia
         .set_mode(Some(kad::Mode::Server));
-    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
-    let mut interval = interval(Duration::from_secs(5));
+    if std::env::args().nth(1).is_none() {
+        swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+    }
+
     loop {
         tokio::select! {
-            _ = interval.tick() => {
-                println!("Number of connected peers: {}", swarm.connected_peers().count());
-            }
-            event = swarm.select_next_some() => {
-                #[allow(clippy::single_match)]
-                match event {
-                    SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                        for (peer_id, addr) in list {
-                            swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            event = swarm.select_next_some() => handler(&mut swarm, event)?,
         }
     }
+}
+
+fn handler(
+    swarm: &mut Swarm<Behaviour>,
+    event: SwarmEvent<BehaviourEvent>,
+) -> Result<(), Box<dyn Error>> {
+    match event {
+        SwarmEvent::ConnectionEstablished { .. } if swarm.listeners().count() == 0 => {
+            swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+        }
+        SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+            for (peer_id, addr) in list {
+                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
