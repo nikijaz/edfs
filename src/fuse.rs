@@ -1,6 +1,15 @@
-use fuser::Filesystem;
+use std::time::Duration;
 
-struct Fuse {}
+use fuser::{Errno, Filesystem, Generation};
+
+use crate::{
+    CHUNK_SIZE_BYTES,
+    storage::{INode, INodeAttr, Storage},
+};
+
+struct Fuse {
+    storage: Storage,
+}
 
 impl Filesystem for Fuse {
     fn lookup(
@@ -10,6 +19,15 @@ impl Filesystem for Fuse {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEntry,
     ) {
+        let tree = self.storage.tree.read().unwrap();
+        let node = tree
+            .get_child(parent, &name.to_string_lossy())
+            .and_then(|inode| tree.get(inode));
+
+        match node {
+            Some(node) => reply.entry(&Duration::from_secs(1), &node.attr(), Generation(0)),
+            None => reply.error(Errno::ENOENT),
+        }
     }
 
     fn getattr(
@@ -19,6 +37,13 @@ impl Filesystem for Fuse {
         _fh: Option<fuser::FileHandle>,
         reply: fuser::ReplyAttr,
     ) {
+        let tree = self.storage.tree.read().unwrap();
+        let node = tree.get(ino);
+
+        match node {
+            Some(node) => reply.attr(&Duration::from_secs(1), &node.attr()),
+            None => reply.error(Errno::ENOENT),
+        }
     }
 
     fn setattr(
@@ -39,6 +64,24 @@ impl Filesystem for Fuse {
         _flags: Option<fuser::BsdFileFlags>,
         reply: fuser::ReplyAttr,
     ) {
+        if let Some(size) = size {
+            if let Some(_) = fh {
+                // TODO: FH
+            } else {
+                let mut tree = self.storage.tree.write().unwrap();
+
+                if let Some(INode::File { hashes, .. }) = tree.get(ino) {
+                    let mut hashes = hashes.clone();
+                    let needed_chunks = (size + CHUNK_SIZE_BYTES - 1) / CHUNK_SIZE_BYTES;
+                    hashes.truncate(needed_chunks as usize);
+                    tree.update(ino, size, hashes);
+
+                    // TODO: Gossip
+                }
+            }
+        }
+
+        self.getattr(_req, ino, fh, reply);
     }
 
     fn mkdir(
@@ -50,6 +93,13 @@ impl Filesystem for Fuse {
         _umask: u32,
         reply: fuser::ReplyEntry,
     ) {
+        {
+            let mut tree = self.storage.tree.write().unwrap();
+            tree.add(parent, name.to_string_lossy().to_string(), true);
+        }
+
+        // TODO: Optimise
+        self.lookup(_req, parent, name, reply);
     }
 
     fn readdir(
@@ -60,6 +110,8 @@ impl Filesystem for Fuse {
         offset: u64,
         reply: fuser::ReplyDirectory,
     ) {
+        let tree = self.storage.tree.read().unwrap();
+        if let Some(children) = tree.get_children(ino) {}
     }
 
     fn rmdir(
