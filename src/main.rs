@@ -6,6 +6,7 @@ use tokio::io::{AsyncBufReadExt, BufReader, stdin};
 mod evloop;
 mod fuse;
 mod protocol;
+mod storage;
 mod swarm;
 
 #[tokio::main]
