@@ -13,7 +13,7 @@ mod protocol;
 mod storage;
 mod swarm;
 
-pub const CHUNK_SIZE_BYTES: u64 = 1024 * 1024; // 1MB
+pub const CHUNK_SIZE_BYTES: u64 = 512 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {

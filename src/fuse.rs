@@ -422,7 +422,13 @@ impl Filesystem for Fuse {
         _lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyData,
     ) {
-        log::debug!("FUSE read: ino={:?}, fh={:?}, offset={}, size={}", ino, fh, offset, size);
+        log::debug!(
+            "FUSE read: ino={:?}, fh={:?}, offset={}, size={}",
+            ino,
+            fh,
+            offset,
+            size
+        );
         let (file_size, hashes) = {
             let sessions = rsess!(self);
             if let Some(session) = sessions.get(&fh) {
@@ -456,19 +462,21 @@ impl Filesystem for Fuse {
         let start_index = (offset / chunk_size) as usize;
         let end_index = ((offset + read_size - 1) / chunk_size) as usize;
 
-        let mut output_buffer = Vec::new();
+        let mut fetch_tasks = Vec::new();
 
         for i in start_index..=end_index {
             if i >= hashes.len() {
-                output_buffer.extend(vec![0; chunk_size as usize]);
+                fetch_tasks.push(None);
                 continue;
             }
 
-            let hash = &hashes[i];
-            let chunk_data = rcont!(self).get(hash).cloned();
+            let hash = hashes[i].clone();
+            let chunk_data = rcont!(self).get(&hash).cloned();
 
             if let Some(data) = chunk_data {
-                output_buffer.extend(data);
+                let (tx, rx) = oneshot::channel();
+                let _ = tx.send(Some(data));
+                fetch_tasks.push(Some((hash, rx)));
             } else {
                 let (tx, rx) = oneshot::channel();
                 if self
@@ -477,12 +485,21 @@ impl Filesystem for Fuse {
                         hash: hash.clone(),
                         reply: tx,
                     })
-                    .is_err()
+                    .is_ok()
                 {
-                    reply.error(Errno::EIO);
-                    return;
+                    fetch_tasks.push(Some((hash, rx)));
+                } else {
+                    fetch_tasks.push(None);
                 }
-                match rx.blocking_recv() {
+            }
+        }
+
+        let mut output_buffer =
+            Vec::with_capacity(((end_index - start_index + 1) as u64 * chunk_size) as usize);
+
+        for task in fetch_tasks {
+            match task {
+                Some((hash, rx)) => match rx.blocking_recv() {
                     Ok(Some(data)) => {
                         wcont!(self).insert(hash.clone(), data.clone());
                         output_buffer.extend(data);
@@ -490,6 +507,9 @@ impl Filesystem for Fuse {
                     _ => {
                         output_buffer.extend(vec![0; chunk_size as usize]);
                     }
+                },
+                None => {
+                    output_buffer.extend(vec![0; chunk_size as usize]);
                 }
             }
         }
@@ -511,7 +531,13 @@ impl Filesystem for Fuse {
         _lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyWrite,
     ) {
-        log::debug!("FUSE write: ino={:?}, fh={:?}, offset={}, len={}", ino, fh, offset, data.len());
+        log::debug!(
+            "FUSE write: ino={:?}, fh={:?}, offset={}, len={}",
+            ino,
+            fh,
+            offset,
+            data.len()
+        );
         let chunk_size = CHUNK_SIZE_BYTES;
 
         if data.is_empty() {
