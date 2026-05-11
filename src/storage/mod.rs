@@ -5,40 +5,49 @@ use std::{
 };
 
 use fuser::{FileAttr, INodeNo};
+use libp2p::PeerId;
+use serde::{Deserialize, Serialize};
 
 use crate::storage::{data::StorageData, tree::StorageTree};
 
 mod data;
-mod tree;
+pub mod tree;
 
-pub type FileName = String;
 pub type Hash = Vec<u8>;
 pub type Data = Vec<u8>;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum INode {
     File {
-        inode: INodeNo,
-        parent: INodeNo,
-        name: FileName,
+        ino: INodeNo,
+        pino: INodeNo,
+        name: String,
+        author: PeerId,
+        mtime: u128,
         size: u64,
         hashes: Vec<Hash>,
     },
     Directory {
-        inode: INodeNo,
-        parent: INodeNo,
-        name: FileName,
-        children: HashMap<FileName, INodeNo>,
+        ino: INodeNo,
+        pino: INodeNo,
+        name: String,
+        author: PeerId,
+        mtime: u128,
+        children: HashMap<String, INodeNo>,
+    },
+    Tombstone {
+        ino: INodeNo,
+        mtime: u128,
+        author: PeerId,
     },
 }
 
-pub trait INodeAttr {
-    fn attr(&self) -> FileAttr;
-}
-
-impl INodeAttr for INode {
-    fn attr(&self) -> FileAttr {
+impl INode {
+    pub fn attr(&self) -> FileAttr {
         match self {
-            INode::File { inode, size, .. } => FileAttr {
+            INode::File {
+                ino: inode, size, ..
+            } => FileAttr {
                 ino: inode.clone(),
                 size: size.clone(),
                 blocks: (size + 511) / 512,
@@ -55,7 +64,7 @@ impl INodeAttr for INode {
                 blksize: 512,
                 flags: 0,
             },
-            INode::Directory { inode, .. } => FileAttr {
+            INode::Directory { ino: inode, .. } => FileAttr {
                 ino: inode.clone(),
                 size: 4096,
                 blocks: 8,
@@ -72,6 +81,7 @@ impl INodeAttr for INode {
                 blksize: 4096,
                 flags: 0,
             },
+            _ => panic!("Invalid node type: .attr()"),
         }
     }
 }

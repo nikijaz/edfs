@@ -17,15 +17,15 @@ impl StorageData {
         }
     }
 
-    pub fn push_chunk(&mut self, hash: Hash, data: Data) -> bool {
+    pub fn get(&self, hash: &Hash) -> Option<&Data> {
+        self.data.get(hash)
+    }
+
+    pub fn insert(&mut self, hash: Hash, data: Data) -> bool {
         if self.used_memory + data.len() > self.max_memory {
             return false;
         }
         self.data.insert(hash, data);
         true
-    }
-
-    pub fn pull_chunk(&self, hash: &Hash) -> Option<&Data> {
-        self.data.get(hash)
     }
 }
