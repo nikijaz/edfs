@@ -164,8 +164,10 @@ async fn tick_swarm(
                         Request::PullChunk { hash } => {
                             let data = storage.content.read().unwrap().get(&hash).cloned();
                             if let Some(data) = data {
+                                log::debug!("Serving chunk {:?} to {:?}", hash, peer);
                                 let _ = swarm.behaviour_mut().request_response.send_response(channel, Response::Data(data));
                             } else {
+                                log::warn!("Chunk {:?} requested by {:?} not found", hash, peer);
                                 let _ = swarm.behaviour_mut().request_response.send_response(channel, Response::Error(crate::protocol::Error::ChunkNotFound));
                             }
                         }

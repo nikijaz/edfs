@@ -25,7 +25,10 @@ impl StorageData {
         if self.used_memory + data.len() > self.max_memory {
             return false;
         }
-        self.data.insert(hash, data);
+        if let Some(old) = self.data.insert(hash, data.clone()) {
+            self.used_memory -= old.len();
+        }
+        self.used_memory += data.len();
         true
     }
 }

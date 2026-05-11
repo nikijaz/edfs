@@ -59,7 +59,8 @@ pub fn init(secret: &str) -> Result<Swarm<Behaviour>, Box<dyn Error>> {
                         libp2p::StreamProtocol::new("/edfs/dev"),
                         ProtocolSupport::Full,
                     )],
-                    request_response::Config::default(),
+                    request_response::Config::default()
+                        .with_request_timeout(std::time::Duration::from_secs(60)),
                 ),
             })
         })?
