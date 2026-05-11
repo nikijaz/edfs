@@ -10,18 +10,19 @@ use libp2p::{
 };
 use tokio::{
     io::{BufReader, Lines, Stdin},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
 };
 
 use crate::{
     protocol::{Gossip, Request, Response, SwarmCommand},
-    storage::Storage,
+    storage::{Data, Storage},
     swarm::{Behaviour, BehaviourEvent},
 };
 
 pub struct LoopState {
     pub gossip_queue: VecDeque<Gossip>,
     pub syncing: bool,
+    pub pending_fetches: std::collections::HashMap<request_response::OutboundRequestId, oneshot::Sender<Option<Data>>>,
 }
 
 impl LoopState {
@@ -29,6 +30,7 @@ impl LoopState {
         Self {
             gossip_queue: VecDeque::new(),
             syncing: true,
+            pending_fetches: std::collections::HashMap::new(),
         }
     }
 }
@@ -43,7 +45,7 @@ pub async fn tick(
     tokio::select! {
         event = swarm.select_next_some() => tick_swarm(swarm, event, storage, state).await?,
         Ok(Some(line)) = stdin.next_line() => tick_stdin(stdin, line)?,
-        Some(cmd) = command_rx.recv() => tick_command(swarm, cmd, storage).await?,
+        Some(cmd) = command_rx.recv() => tick_command(swarm, cmd, storage, state).await?,
     }
     Ok(())
 }
@@ -52,6 +54,7 @@ async fn tick_command(
     swarm: &mut Swarm<Behaviour>,
     cmd: SwarmCommand,
     storage: &Arc<Storage>,
+    state: &mut LoopState,
 ) -> Result<(), Box<dyn Error>> {
     match cmd {
         SwarmCommand::ApplyFsEvent { event, reply } => {
@@ -78,22 +81,19 @@ async fn tick_command(
         }
         SwarmCommand::FetchChunk { hash, reply } => {
             log::debug!("Fetching chunk: {:?}", hash);
-            let mut peers = Vec::new();
-            for bucket in swarm.behaviour_mut().kademlia.kbuckets() {
-                for entry in bucket.iter() {
-                    peers.push(entry.node.key.preimage().clone());
-                }
-            }
+            let peers: Vec<_> = swarm.connected_peers().cloned().collect();
             
             if peers.is_empty() {
-                log::warn!("No peers found in Kademlia to fetch chunk");
+                log::warn!("No connected peers to fetch chunk");
+                let _ = reply.send(None);
+                return Ok(());
             }
 
-            for peer in peers {
-                log::debug!("Requesting chunk from peer: {:?}", peer);
-                swarm.behaviour_mut().request_response.send_request(&peer, Request::PullChunk { hash: hash.clone() });
-            }
-            let _ = reply.send(None); 
+            // Simple strategy: ask the first connected peer
+            let peer = peers[0];
+            log::debug!("Requesting chunk from peer: {:?}", peer);
+            let request_id = swarm.behaviour_mut().request_response.send_request(&peer, Request::PullChunk { hash: hash.clone() });
+            state.pending_fetches.insert(request_id, reply);
         }
     }
     Ok(())
@@ -175,7 +175,7 @@ async fn tick_swarm(
                         }
                     }
                 }
-                request_response::Message::Response { response, .. } => {
+                request_response::Message::Response { response, request_id, .. } => {
                     log::debug!("Received response from {:?}: {:?}", peer, response);
                     match response {
                         Response::TreeState(tree) => {
@@ -188,9 +188,27 @@ async fn tick_swarm(
                                 }
                             }
                         }
+                        Response::Data(data) => {
+                            if let Some(reply) = state.pending_fetches.remove(&request_id) {
+                                let _ = reply.send(Some(data));
+                            }
+                        }
+                        Response::Error(e) => {
+                            log::warn!("Peer {:?} returned error: {:?}", peer, e);
+                            if let Some(reply) = state.pending_fetches.remove(&request_id) {
+                                let _ = reply.send(None);
+                            }
+                        }
                         _ => {}
                     }
                 }
+            }
+        }
+
+        SwarmEvent::Behaviour(BehaviourEvent::RequestResponse(request_response::Event::OutboundFailure { request_id, error, .. })) => {
+            log::error!("Request-Response outbound failure: {:?}", error);
+            if let Some(reply) = state.pending_fetches.remove(&request_id) {
+                let _ = reply.send(None);
             }
         }
 
