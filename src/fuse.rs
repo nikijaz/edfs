@@ -81,6 +81,7 @@ impl Filesystem for Fuse {
         reply: fuser::ReplyEntry,
     ) {
         let name = name.to_string_lossy().to_string();
+        log::debug!("FUSE lookup: parent={:?}, name={}", pino, name);
 
         let tree = rtree!(self);
         let node = tree.get_child(&pino, &name).and_then(|ino| tree.get(&ino));
@@ -98,6 +99,7 @@ impl Filesystem for Fuse {
         fh: Option<fuser::FileHandle>,
         reply: fuser::ReplyAttr,
     ) {
+        log::debug!("FUSE getattr: ino={:?}, fh={:?}", ino, fh);
         if let Some(fh) = fh {
             if let Some(session) = rsess!(self).get(&fh) {
                 reply.attr(&DURATION, &session.node.attr());
@@ -231,6 +233,7 @@ impl Filesystem for Fuse {
         offset: u64,
         mut reply: fuser::ReplyDirectory,
     ) {
+        log::debug!("FUSE readdir: ino={:?}, offset={}", ino, offset);
         let tree = rtree!(self);
         let node = tree.get(&ino);
 
@@ -276,6 +279,7 @@ impl Filesystem for Fuse {
         reply: fuser::ReplyEmpty,
     ) {
         let name = name.to_string_lossy().to_string();
+        log::info!("FUSE rmdir: parent={:?}, name={}", parent, name);
 
         let path = {
             let tree = rtree!(self);
@@ -315,6 +319,7 @@ impl Filesystem for Fuse {
         reply: fuser::ReplyCreate,
     ) {
         let name = name.to_string_lossy().to_string();
+        log::info!("FUSE create: parent={:?}, name={}", parent, name);
 
         let path = {
             let tree = rtree!(self);
@@ -381,6 +386,7 @@ impl Filesystem for Fuse {
         _flags: fuser::OpenFlags,
         reply: fuser::ReplyOpen,
     ) {
+        log::debug!("FUSE open: ino={:?}", ino);
         let tree = rtree!(self);
         if let Some(node) = tree.get(&ino) {
             match node {
@@ -416,6 +422,7 @@ impl Filesystem for Fuse {
         _lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyData,
     ) {
+        log::debug!("FUSE read: ino={:?}, fh={:?}, offset={}, size={}", ino, fh, offset, size);
         let (file_size, hashes) = {
             let sessions = rsess!(self);
             if let Some(session) = sessions.get(&fh) {
@@ -495,7 +502,7 @@ impl Filesystem for Fuse {
     fn write(
         &self,
         _req: &fuser::Request,
-        _ino: fuser::INodeNo,
+        ino: fuser::INodeNo,
         fh: fuser::FileHandle,
         offset: u64,
         data: &[u8],
@@ -504,6 +511,7 @@ impl Filesystem for Fuse {
         _lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyWrite,
     ) {
+        log::debug!("FUSE write: ino={:?}, fh={:?}, offset={}, len={}", ino, fh, offset, data.len());
         let chunk_size = CHUNK_SIZE_BYTES;
 
         if data.is_empty() {
@@ -603,6 +611,7 @@ impl Filesystem for Fuse {
         _lock_owner: fuser::LockOwner,
         reply: fuser::ReplyEmpty,
     ) {
+        log::debug!("FUSE flush: ino={:?}, fh={:?}", ino, fh);
         let mut dirty = false;
         let mut size = 0;
         let mut hashes = Vec::new();
@@ -658,13 +667,14 @@ impl Filesystem for Fuse {
     fn release(
         &self,
         _req: &fuser::Request,
-        _ino: fuser::INodeNo,
+        ino: fuser::INodeNo,
         fh: fuser::FileHandle,
         _flags: fuser::OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        log::debug!("FUSE release: ino={:?}, fh={:?}", ino, fh);
         wsess!(self).remove(&fh);
         reply.ok();
     }
@@ -677,6 +687,7 @@ impl Filesystem for Fuse {
         reply: fuser::ReplyEmpty,
     ) {
         let name = name.to_string_lossy().to_string();
+        log::info!("FUSE unlink: parent={:?}, name={}", parent, name);
 
         let path = {
             let tree = rtree!(self);
