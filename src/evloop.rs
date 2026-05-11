@@ -1,10 +1,12 @@
-use std::{collections::VecDeque, error::Error, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    error::Error,
+    sync::Arc,
+};
 
 use libp2p::{Swarm, futures::StreamExt, gossipsub, mdns, request_response, swarm::SwarmEvent};
-use tokio::{
-    io::{BufReader, Lines, Stdin},
-    sync::{mpsc, oneshot},
-};
+use rand::seq::SliceRandom;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     protocol::{Gossip, Request, Response, SwarmCommand},
@@ -13,34 +15,32 @@ use crate::{
 };
 
 pub struct LoopState {
-    pub gossip_queue: VecDeque<Gossip>,
-    pub syncing: bool,
-    pub request_to_hash: std::collections::HashMap<request_response::OutboundRequestId, Hash>,
-    pub hash_to_replies: std::collections::HashMap<Hash, Vec<oneshot::Sender<Option<Data>>>>,
+    pub gossips: VecDeque<Gossip>,
+    pub is_syncing: bool,
+    pub request_id_to_chunk_hash: HashMap<request_response::OutboundRequestId, Hash>,
+    pub chunk_hash_to_fuse: HashMap<Hash, Vec<oneshot::Sender<Option<Data>>>>,
 }
 
 impl LoopState {
     pub fn new() -> Self {
         Self {
-            gossip_queue: VecDeque::new(),
-            syncing: true,
-            request_to_hash: std::collections::HashMap::new(),
-            hash_to_replies: std::collections::HashMap::new(),
+            gossips: VecDeque::new(),
+            is_syncing: true,
+            request_id_to_chunk_hash: HashMap::new(),
+            chunk_hash_to_fuse: HashMap::new(),
         }
     }
 }
 
 pub async fn tick(
     swarm: &mut Swarm<Behaviour>,
-    stdin: &mut Lines<BufReader<Stdin>>,
-    command_rx: &mut mpsc::Receiver<SwarmCommand>,
+    rx: &mut mpsc::Receiver<SwarmCommand>,
     storage: &Arc<Storage>,
     state: &mut LoopState,
 ) -> Result<(), Box<dyn Error>> {
     tokio::select! {
         event = swarm.select_next_some() => tick_swarm(swarm, event, storage, state).await?,
-        Ok(Some(line)) = stdin.next_line() => tick_stdin(stdin, line)?,
-        Some(cmd) = command_rx.recv() => tick_command(swarm, cmd, storage, state).await?,
+        Some(cmd) = rx.recv() => tick_command(swarm, cmd, storage, state).await?,
     }
     Ok(())
 }
@@ -53,11 +53,10 @@ async fn tick_command(
 ) -> Result<(), Box<dyn Error>> {
     match cmd {
         SwarmCommand::ApplyFsEvent { event, reply } => {
-            log::debug!("Applying local FS event: {:?}", event);
+            let author = swarm.local_peer_id().clone();
             let mtime = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos();
-            let author = swarm.local_peer_id().clone();
 
             let ino = storage
                 .tree
@@ -65,21 +64,17 @@ async fn tick_command(
                 .unwrap()
                 .apply(event.clone(), author, mtime);
 
-            // Broadcast gossip
             let gossip = Gossip { mtime, event };
             if let Ok(encoded) = bincode::serialize(&gossip) {
                 let topic = gossipsub::IdentTopic::new("edfs-metadata");
                 if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, encoded) {
                     log::error!("Failed to publish gossip: {:?}", e);
-                } else {
-                    log::debug!("Published gossip for event");
                 }
             }
 
             let _ = reply.send(ino);
         }
         SwarmCommand::FetchChunk { hash, reply } => {
-            log::debug!("Fetching chunk: {:?}", hash);
             let mut peers: Vec<_> = swarm.connected_peers().cloned().collect();
 
             if peers.is_empty() {
@@ -88,29 +83,28 @@ async fn tick_command(
                 return Ok(());
             }
 
-            // Shuffle and take up to 3
-            use rand::seq::SliceRandom;
             let mut rng = rand::rng();
             peers.shuffle(&mut rng);
-            let targets = if peers.len() > 3 {
+            let peers = if peers.len() > 3 {
                 peers[..3].to_vec()
             } else {
                 peers
             };
 
             state
-                .hash_to_replies
+                .chunk_hash_to_fuse
                 .entry(hash.clone())
                 .or_default()
                 .push(reply);
 
-            for peer in targets {
-                log::debug!("Requesting chunk {:?} from peer: {:?}", hash, peer);
+            for peer in peers {
                 let request_id = swarm
                     .behaviour_mut()
                     .request_response
                     .send_request(&peer, Request::PullChunk { hash: hash.clone() });
-                state.request_to_hash.insert(request_id, hash.clone());
+                state
+                    .request_id_to_chunk_hash
+                    .insert(request_id, hash.clone());
             }
         }
     }
@@ -128,20 +122,12 @@ async fn tick_swarm(
             log::info!("Listening on {:?}", address);
         }
 
-        SwarmEvent::IncomingConnection { .. } => {
-            log::debug!("Incoming connection attempt");
-        }
-
-        SwarmEvent::Dialing { peer_id, .. } => {
-            log::debug!("Dialing peer {:?}", peer_id);
-        }
-
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             log::info!("Connection established with {:?}", peer_id);
             if swarm.listeners().count() == 0 {
                 swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
             }
-            if state.syncing {
+            if state.is_syncing {
                 log::info!("Requesting tree state from {:?}", peer_id);
                 swarm
                     .behaviour_mut()
@@ -166,9 +152,9 @@ async fn tick_swarm(
             ..
         })) => {
             if let Ok(gossip) = bincode::deserialize::<Gossip>(&message.data) {
-                if state.syncing {
+                if state.is_syncing {
                     log::info!("Queuing gossip from {:?} while syncing", message.source);
-                    state.gossip_queue.push_back(gossip);
+                    state.gossips.push_back(gossip);
                 } else {
                     log::info!("Applying gossip from {:?}", message.source);
                     storage.tree.write().unwrap().apply(
@@ -187,59 +173,55 @@ async fn tick_swarm(
         )) => match message {
             request_response::Message::Request {
                 request, channel, ..
-            } => {
-                log::debug!("Received request from {:?}: {:?}", peer, request);
-                match request {
-                    Request::PullTree => {
-                        let tree = storage.tree.read().unwrap().clone();
+            } => match request {
+                Request::PullTree => {
+                    let tree = storage.tree.read().unwrap().clone();
+                    let _ = swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_response(channel, Response::TreeState(tree));
+                }
+                Request::PullChunk { hash } => {
+                    let data = storage.content.read().unwrap().get(&hash).cloned();
+                    if let Some(data) = data {
                         let _ = swarm
                             .behaviour_mut()
                             .request_response
-                            .send_response(channel, Response::TreeState(tree));
-                    }
-                    Request::PullChunk { hash } => {
-                        let data = storage.content.read().unwrap().get(&hash).cloned();
-                        if let Some(data) = data {
-                            log::debug!("Serving chunk {:?} to {:?}", hash, peer);
-                            let _ = swarm
-                                .behaviour_mut()
-                                .request_response
-                                .send_response(channel, Response::Data(data));
-                        } else {
-                            log::warn!("Chunk {:?} requested by {:?} not found", hash, peer);
-                            let _ = swarm.behaviour_mut().request_response.send_response(
-                                channel,
-                                Response::Error(crate::protocol::Error::ChunkNotFound),
-                            );
-                        }
-                    }
-                    Request::PushChunk { hash, data } => {
-                        storage.content.write().unwrap().insert(hash, data);
-                        let _ = swarm
-                            .behaviour_mut()
-                            .request_response
-                            .send_response(channel, Response::Ack);
+                            .send_response(channel, Response::Data(data));
+                    } else {
+                        log::warn!("Chunk {:?} requested by {:?} not found", hash, peer);
+                        let _ = swarm.behaviour_mut().request_response.send_response(
+                            channel,
+                            Response::Error(crate::protocol::Error::ChunkNotFound),
+                        );
                     }
                 }
-            }
+                Request::PushChunk { hash, data } => {
+                    storage.content.write().unwrap().insert(hash, data);
+                    let _ = swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_response(channel, Response::Ack);
+                }
+            },
+
             request_response::Message::Response {
                 response,
                 request_id,
                 ..
             } => {
-                log::debug!("Received response from {:?}: {:?}", peer, response);
-                if let Some(hash) = state.request_to_hash.remove(&request_id) {
+                if let Some(hash) = state.request_id_to_chunk_hash.remove(&request_id) {
                     match response {
                         Response::TreeState(tree) => {
-                            if state.syncing {
+                            if state.is_syncing {
                                 log::info!(
                                     "Received tree state from {:?}. Applying queued gossips: {}",
                                     peer,
-                                    state.gossip_queue.len()
+                                    state.gossips.len()
                                 );
                                 *storage.tree.write().unwrap() = tree;
-                                state.syncing = false;
-                                while let Some(gossip) = state.gossip_queue.pop_front() {
+                                state.is_syncing = false;
+                                while let Some(gossip) = state.gossips.pop_front() {
                                     storage.tree.write().unwrap().apply(
                                         gossip.event,
                                         peer.clone(),
@@ -249,11 +231,11 @@ async fn tick_swarm(
                             }
                         }
                         Response::Data(data) => {
-                            if let Some(replies) = state.hash_to_replies.remove(&hash) {
+                            if let Some(replies) = state.chunk_hash_to_fuse.remove(&hash) {
                                 for reply in replies {
                                     let _ = reply.send(Some(data.clone()));
                                 }
-                                state.request_to_hash.retain(|_, h| h != &hash);
+                                state.request_id_to_chunk_hash.retain(|_, h| h != &hash);
                             }
                         }
                         Response::Error(e) => {
@@ -263,8 +245,8 @@ async fn tick_swarm(
                                 hash,
                                 e
                             );
-                            if !state.request_to_hash.values().any(|h| h == &hash) {
-                                if let Some(replies) = state.hash_to_replies.remove(&hash) {
+                            if !state.request_id_to_chunk_hash.values().any(|h| h == &hash) {
+                                if let Some(replies) = state.chunk_hash_to_fuse.remove(&hash) {
                                     for reply in replies {
                                         let _ = reply.send(None);
                                     }
@@ -287,9 +269,9 @@ async fn tick_swarm(
                 request_id,
                 error
             );
-            if let Some(hash) = state.request_to_hash.remove(&request_id) {
-                if !state.request_to_hash.values().any(|h| h == &hash) {
-                    if let Some(replies) = state.hash_to_replies.remove(&hash) {
+            if let Some(hash) = state.request_id_to_chunk_hash.remove(&request_id) {
+                if !state.request_id_to_chunk_hash.values().any(|h| h == &hash) {
+                    if let Some(replies) = state.chunk_hash_to_fuse.remove(&hash) {
                         for reply in replies {
                             let _ = reply.send(None);
                         }
@@ -300,9 +282,5 @@ async fn tick_swarm(
 
         _ => {}
     }
-    Ok(())
-}
-
-fn tick_stdin(_stdin: &mut Lines<BufReader<Stdin>>, _line: String) -> Result<(), Box<dyn Error>> {
     Ok(())
 }

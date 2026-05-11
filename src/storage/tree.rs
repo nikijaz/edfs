@@ -132,13 +132,6 @@ impl StorageTree {
         })
     }
 
-    pub fn get_children(&self, pino: &INodeNo) -> Option<&HashMap<String, INodeNo>> {
-        self.nodes.get(pino).and_then(|node| match node {
-            INode::Directory { children, .. } => Some(children),
-            _ => None,
-        })
-    }
-
     pub fn get_path(&self, mut ino: INodeNo) -> String {
         let mut parts = Vec::new();
         while ino != INodeNo::ROOT {
