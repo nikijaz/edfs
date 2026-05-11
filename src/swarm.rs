@@ -41,7 +41,10 @@ pub fn init(secret: &str) -> Result<Swarm<Behaviour>, Box<dyn Error>> {
             Ok(Behaviour {
                 gossipsub: gossipsub::Behaviour::new(
                     gossipsub::MessageAuthenticity::Signed(identity.clone()),
-                    gossipsub::Config::default(),
+                    gossipsub::ConfigBuilder::default()
+                        .max_transmit_size(2 * 1024 * 1024)
+                        .build()
+                        .expect("Valid gossipsub config"),
                 )?,
                 kademlia: kad::Behaviour::new(
                     identity.public().to_peer_id(),

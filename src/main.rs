@@ -13,7 +13,7 @@ mod protocol;
 mod storage;
 mod swarm;
 
-pub const CHUNK_SIZE_BYTES: u64 = 1024;
+pub const CHUNK_SIZE_BYTES: u64 = 1024 * 1024; // 1MB
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -40,9 +40,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let fs = fuse::Fuse::new(storage.clone(), command_tx);
 
     let mut config = fuser::Config::default();
-    config.mount_options = vec![
-        MountOption::FSName("edfs".to_string()),
-    ];
+    config.mount_options = vec![MountOption::FSName("edfs".to_string())];
 
     let m_point = mountpoint.clone();
     tokio::task::spawn_blocking(move || {
@@ -81,12 +79,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Cleanup
     log::info!("Shutting down event loop...");
     drop(command_rx);
-    
+
     log::info!("Cleaning up mountpoint: {}", mountpoint);
     let _ = std::process::Command::new("fusermount")
         .arg("-uz")
         .arg(&mountpoint)
         .status();
+
+    // Give the kernel time to detach before removing the directory
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     let _ = std::fs::remove_dir(mountpoint);
 
     Ok(())
