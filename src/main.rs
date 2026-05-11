@@ -3,7 +3,7 @@ use std::{error::Error, sync::Arc};
 use rand::RngExt;
 use tokio::sync::mpsc;
 
-use crate::fuse::Fuse;
+use crate::{evloop::LoopState, fuse::Fuse};
 
 mod evloop;
 mod fuse;
@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     log::info!("EDFS Started!");
 
-    let mut loop_state = evloop::LoopState::new();
+    let mut loop_state = LoopState::new();
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {

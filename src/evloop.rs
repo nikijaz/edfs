@@ -175,7 +175,9 @@ async fn tick_swarm(
                 request, channel, ..
             } => match request {
                 Request::PullTree => {
+                    log::info!("Got PullTree request...");
                     let tree = storage.tree.read().unwrap().clone();
+                    log::info!("PullTree pong!");
                     let _ = swarm
                         .behaviour_mut()
                         .request_response
@@ -209,54 +211,54 @@ async fn tick_swarm(
                 response,
                 request_id,
                 ..
-            } => {
-                if let Some(hash) = state.request_id_to_chunk_hash.remove(&request_id) {
-                    match response {
-                        Response::TreeState(tree) => {
-                            if state.is_syncing {
-                                log::info!(
-                                    "Received tree state from {:?}. Applying queued gossips: {}",
-                                    peer,
-                                    state.gossips.len()
-                                );
-                                *storage.tree.write().unwrap() = tree;
-                                state.is_syncing = false;
-                                while let Some(gossip) = state.gossips.pop_front() {
-                                    storage.tree.write().unwrap().apply(
-                                        gossip.event,
-                                        peer.clone(),
-                                        gossip.mtime,
-                                    );
-                                }
-                            }
-                        }
-                        Response::Data(data) => {
-                            if let Some(replies) = state.chunk_hash_to_fuse.remove(&hash) {
-                                for reply in replies {
-                                    let _ = reply.send(Some(data.clone()));
-                                }
-                                state.request_id_to_chunk_hash.retain(|_, h| h != &hash);
-                            }
-                        }
-                        Response::Error(e) => {
-                            log::warn!(
-                                "Peer {:?} returned error for hash {:?}: {:?}",
-                                peer,
-                                hash,
-                                e
+            } => match response {
+                Response::TreeState(tree) => {
+                    if state.is_syncing {
+                        log::info!(
+                            "Received tree state from {:?}. Applying queued gossips: {}",
+                            peer,
+                            state.gossips.len()
+                        );
+                        *storage.tree.write().unwrap() = tree;
+                        state.is_syncing = false;
+                        while let Some(gossip) = state.gossips.pop_front() {
+                            storage.tree.write().unwrap().apply(
+                                gossip.event,
+                                peer.clone(),
+                                gossip.mtime,
                             );
-                            if !state.request_id_to_chunk_hash.values().any(|h| h == &hash) {
-                                if let Some(replies) = state.chunk_hash_to_fuse.remove(&hash) {
-                                    for reply in replies {
-                                        let _ = reply.send(None);
-                                    }
-                                }
-                            }
                         }
-                        _ => {}
                     }
                 }
-            }
+                Response::Data(data) => {
+                    if let Some(hash) = state.request_id_to_chunk_hash.remove(&request_id) {
+                        if let Some(replies) = state.chunk_hash_to_fuse.remove(&hash) {
+                            for reply in replies {
+                                let _ = reply.send(Some(data.clone()));
+                            }
+                            state.request_id_to_chunk_hash.retain(|_, h| h != &hash);
+                        }
+                    }
+                }
+                Response::Error(e) => {
+                    if let Some(hash) = state.request_id_to_chunk_hash.remove(&request_id) {
+                        log::warn!(
+                            "Peer {:?} returned error for hash {:?}: {:?}",
+                            peer,
+                            hash,
+                            e
+                        );
+                        if !state.request_id_to_chunk_hash.values().any(|h| h == &hash) {
+                            if let Some(replies) = state.chunk_hash_to_fuse.remove(&hash) {
+                                for reply in replies {
+                                    let _ = reply.send(None);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
         },
 
         SwarmEvent::Behaviour(BehaviourEvent::RequestResponse(
