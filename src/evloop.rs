@@ -40,7 +40,7 @@ pub async fn tick(
 ) -> Result<(), Box<dyn Error>> {
     tokio::select! {
         event = swarm.select_next_some() => tick_swarm(swarm, event, storage, state).await?,
-        Some(cmd) = rx.recv() => tick_command(swarm, cmd, storage, state).await?,
+        Some(cmd) = rx.recv() => tick_command(swarm, cmd, state).await?,
     }
     Ok(())
 }
@@ -48,31 +48,20 @@ pub async fn tick(
 async fn tick_command(
     swarm: &mut Swarm<Behaviour>,
     cmd: SwarmCommand,
-    storage: &Arc<Storage>,
     state: &mut LoopState,
 ) -> Result<(), Box<dyn Error>> {
     match cmd {
-        SwarmCommand::ApplyFsEvent { event, reply } => {
-            let author = swarm.local_peer_id().clone();
-            let mtime = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos();
-
-            let ino = storage
-                .tree
-                .write()
-                .unwrap()
-                .apply(event.clone(), author, mtime);
-
-            let gossip = Gossip { mtime, event };
-            if let Ok(encoded) = bincode::serialize(&gossip) {
-                let topic = gossipsub::IdentTopic::new("edfs-metadata");
-                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, encoded) {
-                    log::error!("Failed to publish gossip: {:?}", e);
+        SwarmCommand::BroadcastOperation { operation } => {
+            log::info!("Broadcasting CRDT operation");
+            if !operation.is_empty() {
+                let gossip = Gossip { operation };
+                if let Ok(encoded) = bincode::serialize(&gossip) {
+                    let topic = gossipsub::IdentTopic::new("edfs-metadata");
+                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, encoded) {
+                        log::error!("Failed to publish gossip: {:?}", e);
+                    }
                 }
             }
-
-            let _ = reply.send(ino);
         }
         SwarmCommand::FetchChunk { hash, reply } => {
             let mut peers: Vec<_> = swarm.connected_peers().cloned().collect();
@@ -157,13 +146,10 @@ async fn tick_swarm(
                     state.gossips.push_back(gossip);
                 } else {
                     log::info!("Applying gossip from {:?}", message.source);
-                    storage.tree.write().unwrap().apply(
-                        gossip.event,
-                        message
-                            .source
-                            .unwrap_or_else(|| swarm.local_peer_id().clone()),
-                        gossip.mtime,
-                    );
+                    let mut tree = storage.tree.write().unwrap();
+                    for op in gossip.operation {
+                        tree.replica.apply_op(op);
+                    }
                 }
             }
         }
@@ -175,9 +161,8 @@ async fn tick_swarm(
                 request, channel, ..
             } => match request {
                 Request::PullTree => {
-                    log::info!("Got PullTree request...");
+                    log::info!("Pushing tree...");
                     let tree = storage.tree.read().unwrap().clone();
-                    log::info!("PullTree pong!");
                     let _ = swarm
                         .behaviour_mut()
                         .request_response
@@ -212,32 +197,29 @@ async fn tick_swarm(
                 request_id,
                 ..
             } => match response {
-                Response::TreeState(tree) => {
-                    if state.is_syncing {
-                        log::info!(
-                            "Received tree state from {:?}. Applying queued gossips: {}",
-                            peer,
-                            state.gossips.len()
-                        );
-                        *storage.tree.write().unwrap() = tree;
-                        state.is_syncing = false;
-                        while let Some(gossip) = state.gossips.pop_front() {
-                            storage.tree.write().unwrap().apply(
-                                gossip.event,
-                                peer.clone(),
-                                gossip.mtime,
-                            );
+                Response::TreeState(tree) if state.is_syncing => {
+                    log::info!(
+                        "Received tree state from {:?}. Applying queued gossips: {}",
+                        peer,
+                        state.gossips.len()
+                    );
+                    *storage.tree.write().unwrap() = tree;
+                    state.is_syncing = false;
+                    while let Some(gossip) = state.gossips.pop_front() {
+                        let mut tree = storage.tree.write().unwrap();
+                        for op in gossip.operation {
+                            tree.replica.apply_op(op);
                         }
                     }
                 }
                 Response::Data(data) => {
-                    if let Some(hash) = state.request_id_to_chunk_hash.remove(&request_id) {
-                        if let Some(replies) = state.chunk_hash_to_fuse.remove(&hash) {
-                            for reply in replies {
-                                let _ = reply.send(Some(data.clone()));
-                            }
-                            state.request_id_to_chunk_hash.retain(|_, h| h != &hash);
+                    if let Some(hash) = state.request_id_to_chunk_hash.remove(&request_id)
+                        && let Some(replies) = state.chunk_hash_to_fuse.remove(&hash)
+                    {
+                        for reply in replies {
+                            let _ = reply.send(Some(data.clone()));
                         }
+                        state.request_id_to_chunk_hash.retain(|_, h| h != &hash);
                     }
                 }
                 Response::Error(e) => {
@@ -248,11 +230,11 @@ async fn tick_swarm(
                             hash,
                             e
                         );
-                        if !state.request_id_to_chunk_hash.values().any(|h| h == &hash) {
-                            if let Some(replies) = state.chunk_hash_to_fuse.remove(&hash) {
-                                for reply in replies {
-                                    let _ = reply.send(None);
-                                }
+                        if !state.request_id_to_chunk_hash.values().any(|h| h == &hash)
+                            && let Some(replies) = state.chunk_hash_to_fuse.remove(&hash)
+                        {
+                            for reply in replies {
+                                let _ = reply.send(None);
                             }
                         }
                     }
@@ -271,13 +253,12 @@ async fn tick_swarm(
                 request_id,
                 error
             );
-            if let Some(hash) = state.request_id_to_chunk_hash.remove(&request_id) {
-                if !state.request_id_to_chunk_hash.values().any(|h| h == &hash) {
-                    if let Some(replies) = state.chunk_hash_to_fuse.remove(&hash) {
-                        for reply in replies {
-                            let _ = reply.send(None);
-                        }
-                    }
+            if let Some(hash) = state.request_id_to_chunk_hash.remove(&request_id)
+                && !state.request_id_to_chunk_hash.values().any(|h| h == &hash)
+                && let Some(replies) = state.chunk_hash_to_fuse.remove(&hash)
+            {
+                for reply in replies {
+                    let _ = reply.send(None);
                 }
             }
         }

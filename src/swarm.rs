@@ -23,7 +23,7 @@ pub struct Behaviour {
 }
 
 pub fn init(secret: &str) -> Result<Swarm<Behaviour>, Box<dyn Error>> {
-    let secret_hash = sha2::Sha256::digest(secret.to_string()).to_vec();
+    let secret_hash = sha2::Sha256::digest(secret).to_vec();
     let identity = identity::Keypair::generate_ed25519();
 
     let noise = noise::Config::new(&identity)?.with_prologue(secret_hash);

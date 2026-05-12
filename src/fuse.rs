@@ -1,18 +1,10 @@
-#![allow(unused)]
-
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock, atomic::AtomicU64},
-    time::Duration,
-};
-
-use fuser::{Errno, FileHandle, Filesystem, FopenFlags, Generation, INodeNo};
+use fuser::{Errno, FileHandle, Filesystem};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     CHUNK_SIZE_BYTES,
-    protocol::{FsEvent, SwarmCommand},
-    storage::{INode, Storage},
+    protocol::{Meta, SwarmCommand},
+    storage::{Storage, meta_attr, tree::ROOT_ID},
 };
 
 macro_rules! rsess {
@@ -33,6 +25,12 @@ macro_rules! rtree {
     };
 }
 
+macro_rules! wtree {
+    ($self:expr) => {
+        $self.storage.tree.write().unwrap()
+    };
+}
+
 macro_rules! rcont {
     ($self:expr) => {
         $self.storage.content.read().unwrap()
@@ -46,31 +44,30 @@ macro_rules! wcont {
 }
 
 struct FileSession {
-    pub node: INode,
+    pub meta: Meta,
     pub dirty: bool,
 }
 
-pub(crate) struct Fuse {
-    storage: Arc<Storage>,
+const DURATION: std::time::Duration = std::time::Duration::from_secs(1);
+const GENERATION: fuser::Generation = fuser::Generation(1);
+
+pub struct Fuse {
+    storage: std::sync::Arc<Storage>,
     swarm: mpsc::Sender<SwarmCommand>,
-    sessions: RwLock<HashMap<FileHandle, FileSession>>,
-    last_fh: AtomicU64,
+    sessions: std::sync::RwLock<std::collections::HashMap<FileHandle, FileSession>>,
+    last_fh: std::sync::atomic::AtomicU64,
 }
 
 impl Fuse {
-    pub fn new(storage: Arc<Storage>, swarm: mpsc::Sender<SwarmCommand>) -> Self {
+    pub fn new(storage: std::sync::Arc<Storage>, swarm: mpsc::Sender<SwarmCommand>) -> Self {
         Self {
             storage,
             swarm,
-            sessions: RwLock::new(HashMap::new()),
-            last_fh: AtomicU64::new(1),
+            sessions: std::sync::RwLock::new(std::collections::HashMap::new()),
+            last_fh: std::sync::atomic::AtomicU64::new(1),
         }
     }
 }
-
-const DURATION: Duration = Duration::from_secs(1);
-const GENERATION: Generation = Generation(0);
-const FOPEN_FLAGS: FopenFlags = FopenFlags::empty();
 
 impl Filesystem for Fuse {
     fn lookup(
@@ -83,10 +80,12 @@ impl Filesystem for Fuse {
         let name = name.to_string_lossy().to_string();
 
         let tree = rtree!(self);
-        let node = tree.get_child(&pino, &name).and_then(|ino| tree.get(&ino));
+        let node = tree
+            .get_child(&pino, &name)
+            .and_then(|ino| tree.get(&ino).map(|m| (ino, m)));
 
         match node {
-            Some(node) => reply.entry(&DURATION, &node.attr(), GENERATION),
+            Some((ino, meta)) => reply.entry(&DURATION, &meta_attr(&meta, ino), GENERATION),
             None => reply.error(Errno::ENOENT),
         }
     }
@@ -98,18 +97,18 @@ impl Filesystem for Fuse {
         fh: Option<fuser::FileHandle>,
         reply: fuser::ReplyAttr,
     ) {
-        if let Some(fh) = fh {
-            if let Some(session) = rsess!(self).get(&fh) {
-                reply.attr(&DURATION, &session.node.attr());
-                return;
-            }
+        if let Some(fh) = fh
+            && let Some(session) = rsess!(self).get(&fh)
+        {
+            reply.attr(&DURATION, &meta_attr(&session.meta, ino));
+            return;
         }
 
         let tree = rtree!(self);
-        let node = tree.get(&ino);
+        let meta = tree.get(&ino);
 
-        match node {
-            Some(node) => reply.attr(&DURATION, &node.attr()),
+        match meta {
+            Some(meta) => reply.attr(&DURATION, &meta_attr(&meta, ino)),
             None => reply.error(Errno::ENOENT),
         }
     }
@@ -133,43 +132,27 @@ impl Filesystem for Fuse {
         reply: fuser::ReplyAttr,
     ) {
         if let Some(size) = size {
-            let needed_chunks = (size + CHUNK_SIZE_BYTES - 1) / CHUNK_SIZE_BYTES;
+            let tree = rtree!(self);
+            let path = tree.get_path(ino);
 
-            if let Some(fh) = fh {
-                if let Some(session) = wsess!(self).get_mut(&fh) {
-                    if let INode::File {
-                        size: size_old,
-                        hashes,
-                        ..
-                    } = &mut session.node
-                    {
-                        *size_old = size;
-                        hashes.truncate(needed_chunks as usize);
-                        session.dirty = true;
-                    }
-                }
-            } else {
-                let (path, mut hashes) = {
-                    let tree = rtree!(self);
-                    let hashes = match tree.get(&ino) {
-                        Some(INode::File { hashes, .. }) => hashes.clone(),
+            if path != "/" {
+                let needed_chunks = size.div_ceil(CHUNK_SIZE_BYTES);
+                let mut hashes = {
+                    match tree.get(&ino) {
+                        Some(Meta::File { hashes, .. }) => hashes.clone(),
                         _ => {
                             reply.error(Errno::ENOENT);
                             return;
                         }
-                    };
-                    (tree.get_path(ino), hashes)
+                    }
                 };
                 hashes.truncate(needed_chunks as usize);
 
-                let event = FsEvent::SetFile { path, size, hashes };
-                let (tx, rx) = oneshot::channel();
-                if self
-                    .swarm
-                    .blocking_send(SwarmCommand::ApplyFsEvent { event, reply: tx })
-                    .is_ok()
-                {
-                    let _ = rx.blocking_recv();
+                let (_, ops) = wtree!(self).set_file(&path, size, hashes);
+                if !ops.is_empty() {
+                    let _ = self
+                        .swarm
+                        .blocking_send(SwarmCommand::BroadcastOperation { operation: ops });
                 }
             }
         }
@@ -190,36 +173,30 @@ impl Filesystem for Fuse {
 
         let path = {
             let tree = rtree!(self);
-            if pino != INodeNo::ROOT && tree.get(&pino).is_none() {
+            if pino != ROOT_ID && tree.get(&pino).is_none() {
                 reply.error(Errno::ENOENT);
                 return;
             }
-            if pino == INodeNo::ROOT {
+            if pino == ROOT_ID {
                 format!("/{}", name)
             } else {
                 format!("{}/{}", tree.get_path(pino), name)
             }
         };
 
-        let event = FsEvent::CreateDirectory { path };
-        let (tx, rx) = oneshot::channel();
-        if self
-            .swarm
-            .blocking_send(SwarmCommand::ApplyFsEvent { event, reply: tx })
-            .is_err()
-        {
-            reply.error(Errno::EIO);
-            return;
+        let (ino, ops) = wtree!(self).mkdir(&path);
+        if !ops.is_empty() {
+            let _ = self
+                .swarm
+                .blocking_send(SwarmCommand::BroadcastOperation { operation: ops });
         }
 
-        if let Ok(Some(ino)) = rx.blocking_recv() {
-            if let Some(node) = rtree!(self).get(&ino) {
-                reply.entry(&DURATION, &node.attr(), GENERATION);
+        {
+            if let Some(meta) = rtree!(self).get(&ino) {
+                reply.entry(&DURATION, &meta_attr(&meta, ino), GENERATION);
             } else {
                 reply.error(Errno::ENOENT);
             }
-        } else {
-            reply.error(Errno::EIO);
         }
     }
 
@@ -232,19 +209,18 @@ impl Filesystem for Fuse {
         mut reply: fuser::ReplyDirectory,
     ) {
         let tree = rtree!(self);
-        let node = tree.get(&ino);
+        let meta = tree.get(&ino);
 
-        let (parent, children) = match node {
-            Some(INode::Directory {
-                pino: parent,
-                children,
-                ..
-            }) => (*parent, children.clone()),
+        match meta {
+            Some(Meta::Directory { .. }) => {}
             _ => {
                 reply.error(Errno::ENOENT);
                 return;
             }
         };
+
+        let parent = tree.get_parent(&ino).unwrap_or(ino);
+        let children = tree.get_children(&ino);
 
         let mut entries = vec![
             (ino, fuser::FileType::Directory, ".".to_string()),
@@ -253,15 +229,15 @@ impl Filesystem for Fuse {
 
         for (name, cino) in children {
             let kind = match tree.get(&cino) {
-                Some(INode::Directory { .. }) => fuser::FileType::Directory,
-                Some(INode::File { .. }) => fuser::FileType::RegularFile,
+                Some(Meta::Directory { .. }) => fuser::FileType::Directory,
+                Some(Meta::File { .. }) => fuser::FileType::RegularFile,
                 _ => continue,
             };
             entries.push((cino, kind, name));
         }
 
         for (i, (child_ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
-            if reply.add(child_ino, (i as u64) + 1, kind, name) {
+            if reply.add(child_ino, (i + 1) as u64, kind, name) {
                 break;
             }
         }
@@ -279,28 +255,23 @@ impl Filesystem for Fuse {
 
         let path = {
             let tree = rtree!(self);
-            if parent != INodeNo::ROOT && tree.get(&parent).is_none() {
+            if parent != ROOT_ID && tree.get(&parent).is_none() {
                 reply.error(Errno::ENOENT);
                 return;
             }
-            if parent == INodeNo::ROOT {
+            if parent == ROOT_ID {
                 format!("/{}", name)
             } else {
                 format!("{}/{}", tree.get_path(parent), name)
             }
         };
 
-        let event = FsEvent::Delete { path };
-        let (tx, rx) = oneshot::channel();
-        if self
-            .swarm
-            .blocking_send(SwarmCommand::ApplyFsEvent { event, reply: tx })
-            .is_err()
-        {
-            reply.error(Errno::EIO);
-            return;
+        let ops = wtree!(self).delete(&path);
+        if !ops.is_empty() {
+            let _ = self
+                .swarm
+                .blocking_send(SwarmCommand::BroadcastOperation { operation: ops });
         }
-        let _ = rx.blocking_recv();
         reply.ok();
     }
 
@@ -318,57 +289,47 @@ impl Filesystem for Fuse {
 
         let path = {
             let tree = rtree!(self);
-            if parent != INodeNo::ROOT && tree.get(&parent).is_none() {
+            if parent != ROOT_ID && tree.get(&parent).is_none() {
                 reply.error(Errno::ENOENT);
                 return;
             }
-            if parent == INodeNo::ROOT {
+            if parent == ROOT_ID {
                 format!("/{}", name)
             } else {
                 format!("{}/{}", tree.get_path(parent), name)
             }
         };
 
-        let event = FsEvent::SetFile {
-            path,
-            size: 0,
-            hashes: Vec::new(),
-        };
-        let (tx, rx) = oneshot::channel();
-        if self
-            .swarm
-            .blocking_send(SwarmCommand::ApplyFsEvent { event, reply: tx })
-            .is_err()
-        {
-            reply.error(Errno::EIO);
-            return;
+        let (ino, ops) = wtree!(self).set_file(&path, 0, Vec::new());
+        if !ops.is_empty() {
+            let _ = self
+                .swarm
+                .blocking_send(SwarmCommand::BroadcastOperation { operation: ops });
         }
 
-        if let Ok(Some(ino)) = rx.blocking_recv() {
+        {
             let tree = rtree!(self);
-            if let Some(node) = tree.get(&ino) {
+            if let Some(meta) = tree.get(&ino) {
                 let fh = self
                     .last_fh
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 wsess!(self).insert(
                     FileHandle(fh),
                     FileSession {
-                        node: node.clone(),
+                        meta: meta.clone(),
                         dirty: false,
                     },
                 );
                 reply.created(
                     &DURATION,
-                    &node.attr(),
+                    &meta_attr(&meta, ino),
                     GENERATION,
                     FileHandle(fh),
-                    FOPEN_FLAGS,
+                    fuser::FopenFlags::empty(),
                 );
             } else {
                 reply.error(Errno::ENOENT);
             }
-        } else {
-            reply.error(Errno::EIO);
         }
     }
 
@@ -380,23 +341,22 @@ impl Filesystem for Fuse {
         reply: fuser::ReplyOpen,
     ) {
         let tree = rtree!(self);
-        if let Some(node) = tree.get(&ino) {
-            match node {
-                INode::File { .. } => {
+        if let Some(meta) = tree.get(&ino) {
+            match meta {
+                Meta::File { .. } => {
                     let fh = self
                         .last_fh
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     wsess!(self).insert(
                         fuser::FileHandle(fh),
                         FileSession {
-                            node: node.clone(),
+                            meta: meta.clone(),
                             dirty: false,
                         },
                     );
-                    reply.opened(fuser::FileHandle(fh), FOPEN_FLAGS);
+                    reply.opened(fuser::FileHandle(fh), fuser::FopenFlags::empty());
                 }
-                INode::Directory { .. } => reply.error(Errno::EISDIR),
-                _ => reply.error(Errno::ENOENT),
+                Meta::Directory { .. } => reply.error(Errno::EISDIR),
             }
         } else {
             reply.error(Errno::ENOENT);
@@ -417,15 +377,15 @@ impl Filesystem for Fuse {
         let (file_size, hashes) = {
             let sessions = rsess!(self);
             if let Some(session) = sessions.get(&fh) {
-                if let INode::File { size, hashes, .. } = &session.node {
+                if let Meta::File { size, hashes, .. } = &session.meta {
                     (*size, hashes.clone())
                 } else {
                     (0, Vec::new())
                 }
             } else {
                 let tree = rtree!(self);
-                if let Some(INode::File { size, hashes, .. }) = tree.get(&ino) {
-                    (*size, hashes.clone())
+                if let Some(Meta::File { size, hashes, .. }) = tree.get(&ino) {
+                    (size, hashes.clone())
                 } else {
                     (0, Vec::new())
                 }
@@ -507,7 +467,7 @@ impl Filesystem for Fuse {
     fn write(
         &self,
         _req: &fuser::Request,
-        ino: fuser::INodeNo,
+        _ino: fuser::INodeNo,
         fh: fuser::FileHandle,
         offset: u64,
         data: &[u8],
@@ -529,9 +489,9 @@ impl Filesystem for Fuse {
         {
             let sessions = rsess!(self);
             if let Some(session) = sessions.get(&fh) {
-                if let INode::File {
+                if let Meta::File {
                     size: s, hashes: h, ..
-                } = &session.node
+                } = &session.meta
                 {
                     new_size = *s;
                     hashes = h.clone();
@@ -546,7 +506,7 @@ impl Filesystem for Fuse {
             new_size = offset + data.len() as u64;
         }
 
-        let needed_chunks = (new_size + chunk_size - 1) / chunk_size;
+        let needed_chunks = new_size.div_ceil(chunk_size);
         hashes.resize(needed_chunks as usize, vec![0; 32]);
 
         let start_chunk = (offset / chunk_size) as usize;
@@ -592,15 +552,16 @@ impl Filesystem for Fuse {
 
         {
             let mut sessions = wsess!(self);
-            if let Some(session) = sessions.get_mut(&fh) {
-                if let INode::File {
-                    size: s, hashes: h, ..
-                } = &mut session.node
-                {
-                    *s = new_size;
-                    *h = hashes;
-                    session.dirty = true;
-                }
+            if let Some(session) = sessions.get_mut(&fh)
+                && let Meta::File {
+                    size: ref mut s,
+                    hashes: ref mut h,
+                    ..
+                } = session.meta
+            {
+                *s = new_size;
+                *h = hashes;
+                session.dirty = true;
             }
         }
 
@@ -621,17 +582,15 @@ impl Filesystem for Fuse {
 
         {
             let sessions = rsess!(self);
-            if let Some(session) = sessions.get(&fh) {
-                if session.dirty {
-                    if let INode::File {
-                        size: s, hashes: h, ..
-                    } = &session.node
-                    {
-                        size = *s;
-                        hashes = h.clone();
-                        dirty = true;
-                    }
-                }
+            if let Some(session) = sessions.get(&fh)
+                && session.dirty
+                && let Meta::File {
+                    size: s, hashes: h, ..
+                } = &session.meta
+            {
+                size = *s;
+                hashes = h.clone();
+                dirty = true;
             }
         }
 
@@ -648,14 +607,11 @@ impl Filesystem for Fuse {
                 tree.get_path(ino)
             };
 
-            let event = FsEvent::SetFile { path, size, hashes };
-            let (tx, rx) = oneshot::channel();
-            if self
-                .swarm
-                .blocking_send(SwarmCommand::ApplyFsEvent { event, reply: tx })
-                .is_ok()
-            {
-                let _ = rx.blocking_recv();
+            let (_, ops) = wtree!(self).set_file(&path, size, hashes);
+            if !ops.is_empty() {
+                let _ = self
+                    .swarm
+                    .blocking_send(SwarmCommand::BroadcastOperation { operation: ops });
             }
 
             if let Some(s) = wsess!(self).get_mut(&fh) {
@@ -668,7 +624,7 @@ impl Filesystem for Fuse {
     fn release(
         &self,
         _req: &fuser::Request,
-        ino: fuser::INodeNo,
+        _ino: fuser::INodeNo,
         fh: fuser::FileHandle,
         _flags: fuser::OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
@@ -690,29 +646,24 @@ impl Filesystem for Fuse {
 
         let path = {
             let tree = rtree!(self);
-            if parent != INodeNo::ROOT && tree.get(&parent).is_none() {
+            if parent != ROOT_ID && tree.get(&parent).is_none() {
                 reply.error(Errno::ENOENT);
                 return;
             }
-            if parent == INodeNo::ROOT {
+            if parent == ROOT_ID {
                 format!("/{}", name)
             } else {
                 format!("{}/{}", tree.get_path(parent), name)
             }
         };
 
-        let event = FsEvent::Delete { path };
-        let (tx, rx) = oneshot::channel();
-        if self
-            .swarm
-            .blocking_send(SwarmCommand::ApplyFsEvent { event, reply: tx })
-            .is_err()
-        {
-            reply.error(Errno::EIO);
-            return;
+        let ops = wtree!(self).delete(&path);
+        if !ops.is_empty() {
+            let _ = self
+                .swarm
+                .blocking_send(SwarmCommand::BroadcastOperation { operation: ops });
         }
 
-        let _ = rx.blocking_recv();
         reply.ok();
     }
 }

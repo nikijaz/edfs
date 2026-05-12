@@ -33,7 +33,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     log::info!("Secret: {}", secret);
 
     let mut swarm = swarm::init(&secret)?;
-    let storage = Arc::new(storage::Storage::new(STORAGE_SIZE_BYTES));
+    let storage = Arc::new(storage::Storage::new(
+        STORAGE_SIZE_BYTES,
+        *swarm.local_peer_id(),
+    ));
 
     let mountpoint = std::env::args().nth(2).unwrap_or_else(|| "mnt".to_string());
     std::fs::create_dir_all(&mountpoint)?;

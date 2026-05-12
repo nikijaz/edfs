@@ -13,7 +13,7 @@ impl StorageData {
         Self {
             data: HashMap::new(),
             used_memory: 0,
-            max_memory: max_memory,
+            max_memory,
         }
     }
 
@@ -25,10 +25,10 @@ impl StorageData {
         if self.used_memory + data.len() > self.max_memory {
             return false;
         }
-        if let Some(old) = self.data.insert(hash, data.clone()) {
-            self.used_memory -= old.len();
+        if !self.data.contains_key(&hash) {
+            self.used_memory += data.len();
+            self.data.insert(hash, data);
         }
-        self.used_memory += data.len();
         true
     }
 }

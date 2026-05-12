@@ -1,4 +1,6 @@
+use crdt_tree::OpMove;
 use fuser::INodeNo;
+use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -17,6 +19,7 @@ pub enum Request {
     PullTree,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
     Ack,
@@ -25,31 +28,37 @@ pub enum Response {
     Error(Error),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum FsEvent {
-    CreateDirectory {
-        path: String,
-    },
-    SetFile {
-        path: String,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum Meta {
+    File {
+        name: String,
         size: u64,
         hashes: Vec<Hash>,
     },
-    Delete {
-        path: String,
+    Directory {
+        name: String,
     },
 }
 
+impl Meta {
+    pub fn name(&self) -> &str {
+        match self {
+            Meta::File { name, .. } => name,
+            Meta::Directory { name } => name,
+        }
+    }
+}
+
+pub type NodeOpMove = OpMove<INodeNo, Meta, PeerId>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Gossip {
-    pub mtime: u128,
-    pub event: FsEvent,
+    pub operation: Vec<NodeOpMove>,
 }
 
 pub enum SwarmCommand {
-    ApplyFsEvent {
-        event: FsEvent,
-        reply: oneshot::Sender<Option<INodeNo>>,
+    BroadcastOperation {
+        operation: Vec<NodeOpMove>,
     },
     FetchChunk {
         hash: Hash,
