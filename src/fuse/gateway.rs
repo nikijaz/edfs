@@ -33,9 +33,9 @@ impl<N: FileSystemGateway> FuseFileSystem<N> {
                 .await;
 
         let mut all_fetched = true;
-        for (hash, data) in missing_hashes.into_iter().zip(fetched) {
+        for data in fetched {
             match data {
-                Some(data) => self.filesystem.write().cache_chunk(hash, data),
+                Some(data) => self.filesystem.write().cache_chunk(data),
                 None => all_fetched = false,
             }
         }

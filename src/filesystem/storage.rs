@@ -93,10 +93,10 @@ impl ChunkStorage {
         Ok(())
     }
 
-    pub fn cache(&mut self, hash: ChunkHash, data: Vec<u8>) {
-        let chunk_size = data.len();
+    pub fn cache(&mut self, chunk: Chunk) {
+        let chunk_size = chunk.data().len();
 
-        if self.chunks.contains_key(&hash) || chunk_size > self.max_cached_bytes {
+        if self.chunks.contains_key(chunk.hash()) || chunk_size > self.max_cached_bytes {
             return;
         }
 
@@ -110,12 +110,12 @@ impl ChunkStorage {
             };
             self.cached_bytes -= entry.data.len();
         }
-        lru.push_back(hash.clone());
+        lru.push_back(chunk.hash().clone());
 
         self.chunks.insert(
-            hash,
+            chunk.hash().clone(),
             ChunkEntry {
-                data,
+                data: chunk.data().to_vec(),
                 pinned: false,
             },
         );
@@ -136,5 +136,52 @@ impl ChunkStorage {
 
     pub fn contains(&self, hash: &ChunkHash) -> bool {
         self.chunks.contains_key(hash)
+    }
+
+    pub fn is_pinned(&self, hash: &ChunkHash) -> bool {
+        self.chunks.get(hash).is_some_and(|entry| entry.pinned)
+    }
+
+    pub fn is_cached(&self, hash: &ChunkHash) -> bool {
+        self.chunks.get(hash).is_some_and(|entry| !entry.pinned)
+    }
+
+    pub fn pinned_hashes(&self) -> Vec<ChunkHash> {
+        self.chunks
+            .iter()
+            .filter(|(_, entry)| entry.pinned)
+            .map(|(hash, _)| hash.clone())
+            .collect()
+    }
+
+    pub fn promote_to_pinned(&mut self, hash: &ChunkHash) -> bool {
+        let Some(entry) = self.chunks.get_mut(hash) else {
+            return false;
+        };
+        if entry.pinned {
+            return true;
+        }
+        if self.pinned_bytes + entry.data.len() > self.max_pinned_bytes {
+            return false;
+        }
+        let size = entry.data.len();
+        entry.pinned = true;
+        self.pinned_bytes += size;
+        self.cached_bytes -= size;
+        self.cache_lru.lock().retain(|cached| cached != hash);
+        true
+    }
+
+    pub fn evict(&mut self, hash: &ChunkHash) -> bool {
+        let Some(entry) = self.chunks.remove(hash) else {
+            return false;
+        };
+        if entry.pinned {
+            self.pinned_bytes -= entry.data.len();
+        } else {
+            self.cached_bytes -= entry.data.len();
+            self.cache_lru.lock().retain(|cached| cached != hash);
+        }
+        true
     }
 }

@@ -9,7 +9,8 @@ use crate::{
         NetworkBridge, behaviour,
         dispatcher::Dispatcher,
         handlers::{
-            chunk::ChunkHandler, gossip::GossipHandler, mdns::MdnsHandler, tree_sync::SyncHandler,
+            chunk::ChunkHandler, gossip::GossipHandler, mdns::MdnsHandler,
+            replication::ReplicationHandler, tree_sync::SyncHandler,
         },
     },
 };
@@ -35,15 +36,16 @@ pub async fn run(args: Args) -> Result<(), Box<dyn Error>> {
     )));
 
     let (swarm_tx, mut swarm_rx) = mpsc::channel(SWARM_CHANNEL_CAPACITY);
-    let network_bridge = NetworkBridge::new(swarm_tx);
+    let network_bridge = NetworkBridge::new(swarm_tx.clone());
     let fuse = FuseFileSystem::new(filesystem.clone(), network_bridge);
     let mount_session = fuse.mount(&args.mountpoint).await?;
 
     let mut dispatcher = Dispatcher::builder()
-        .handler(MdnsHandler::default())
-        .handler(GossipHandler::default())
+        .handler(MdnsHandler)
+        .handler(GossipHandler)
         .handler(SyncHandler::default())
         .handler(ChunkHandler::default())
+        .handler(ReplicationHandler::new(swarm_tx))
         .build();
 
     let mut swarm = behaviour::build_swarm(identity, &args.secret)?;

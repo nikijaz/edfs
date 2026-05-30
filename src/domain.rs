@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -24,6 +24,10 @@ impl ChunkHash {
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 pub struct Chunk {
@@ -33,7 +37,7 @@ pub struct Chunk {
 
 impl Chunk {
     pub fn new(data: Vec<u8>) -> Self {
-        let hash = ChunkHash::from_bytes(sha2::Sha256::digest(&data).into());
+        let hash = ChunkHash::from_bytes(Sha256::digest(&data).into());
         Self { hash, data }
     }
 

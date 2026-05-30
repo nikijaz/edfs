@@ -7,16 +7,17 @@ pub mod tree;
 pub use mutation::TreeMutation;
 
 use std::collections::HashSet;
+use std::collections::VecDeque;
 
 use uuid::Uuid;
 
 use crate::{
+    domain::{Chunk, ChunkHash, ChunkRef, NodeId, NodeMeta},
     filesystem::{
         error::FileSystemError,
         storage::ChunkStorage,
         tree::{NodeOperation, NodeOperationId, NodeTree},
     },
-    domain::{Chunk, ChunkHash, ChunkRef, NodeId, NodeMeta},
 };
 
 pub struct FileSystemEntry {
@@ -314,8 +315,61 @@ impl FileSystem {
         Ok(TreeMutation::new((), vec![operation]))
     }
 
-    pub fn cache_chunk(&mut self, hash: ChunkHash, data: Vec<u8>) {
-        self.storage.cache(hash, data);
+    pub fn pin_chunk(&mut self, data: Vec<u8>) -> Result<(), FileSystemError> {
+        self.storage.try_pin(std::iter::once(Chunk::new(data)))?;
+        Ok(())
+    }
+
+    pub fn cache_chunk(&mut self, data: Vec<u8>) {
+        self.storage.cache(Chunk::new(data));
+    }
+
+    pub fn is_pinned(&self, hash: &ChunkHash) -> bool {
+        self.storage.is_pinned(hash)
+    }
+
+    pub fn is_cached(&self, hash: &ChunkHash) -> bool {
+        self.storage.is_cached(hash)
+    }
+
+    pub fn pinned_hashes(&self) -> Vec<ChunkHash> {
+        self.storage.pinned_hashes()
+    }
+
+    pub fn promote_to_pinned(&mut self, hash: &ChunkHash) -> bool {
+        self.storage.promote_to_pinned(hash)
+    }
+
+    pub fn evict_chunk(&mut self, hash: &ChunkHash) -> bool {
+        self.storage.evict(hash)
+    }
+
+    pub fn reachable_chunk_hashes(&self) -> HashSet<ChunkHash> {
+        let mut reachable = HashSet::new();
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        visited.insert(NodeId::ROOT);
+        queue.push_back(NodeId::ROOT);
+
+        while let Some(node_id) = queue.pop_front() {
+            let children = match self.tree.children(node_id) {
+                Ok(children) => children,
+                Err(_) => continue,
+            };
+            for child in children {
+                if child == NodeId::TRASH || !visited.insert(child) {
+                    continue;
+                }
+                match self.tree.metadata(child) {
+                    Some(NodeMeta::RegularFile { chunk_refs, .. }) => {
+                        reachable.extend(chunk_refs.iter().map(|chunk_ref| chunk_ref.hash.clone()));
+                    }
+                    Some(NodeMeta::Directory { .. }) => queue.push_back(child),
+                    _ => {}
+                }
+            }
+        }
+        reachable
     }
 
     pub fn missing_chunk_hashes_for(

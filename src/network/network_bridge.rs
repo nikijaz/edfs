@@ -71,6 +71,7 @@ impl ChunkProvider for NetworkBridge {
             .send(SwarmCommand::FetchChunk {
                 hash: hash.clone(),
                 reply: Some(reply),
+                pin: false,
             })
             .await
             .is_err()

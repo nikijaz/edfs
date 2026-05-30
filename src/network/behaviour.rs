@@ -8,7 +8,7 @@ use libp2p::{
     swarm::NetworkBehaviour,
     tcp, yamux,
 };
-use sha2::Digest;
+use sha2::{Digest, Sha256};
 
 use crate::{
     config::{
@@ -29,7 +29,7 @@ pub fn build_swarm(
     identity: identity::Keypair,
     secret: &str,
 ) -> Result<Swarm<Behaviour>, Box<dyn Error>> {
-    let secret_hash = sha2::Sha256::digest(secret).to_vec();
+    let secret_hash = Sha256::digest(secret).to_vec();
 
     let noise = noise::Config::new(&identity)?.with_prologue(secret_hash);
     let yamux = yamux::Config::default();

@@ -22,10 +22,12 @@ pub enum SwarmCommand {
     FetchChunk {
         hash: ChunkHash,
         reply: Option<ChunkReply>,
+        pin: bool,
     },
 }
 
 pub enum Event {
+    Tick,
     Swarm(SwarmEvent<BehaviourEvent>),
     Request {
         request: Request,

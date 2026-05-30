@@ -5,10 +5,11 @@ use parking_lot::RwLock;
 use tokio::sync::mpsc;
 
 use crate::{
+    config::DISPATCH_TICK_INTERVAL,
     filesystem::FileSystem,
     network::{
         behaviour::Behaviour,
-        event::{EventContext, EventHandler, SwarmCommand},
+        event::{Event, EventContext, EventHandler, SwarmCommand},
     },
 };
 
@@ -35,6 +36,7 @@ impl Dispatcher {
                 None => return Err("command channel unavailable".into()),
             },
             event = swarm.select_next_some() => event.into(),
+            _ = tokio::time::sleep(DISPATCH_TICK_INTERVAL) => Event::Tick,
         };
 
         {
